@@ -36,4 +36,4 @@ jobs:
           SCRAPE_PAGES: ${{ github.event.inputs.pages || '3' }}
           MAX_JOBS: ${{ github.event.inputs.max_jobs || '0' }}
           REQUEST_DELAY: "1.0"
-        run: python myjobmag_za_scraper.py
+        run: python za.py
