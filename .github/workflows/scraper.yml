@@ -1,0 +1,39 @@
+name: Scraper (Verbose Test)
+
+# Manual trigger by default. Uncomment the schedule block below once you're
+# happy with the output and want it to run automatically.
+on:
+  workflow_dispatch:
+    inputs:
+      pages:
+        description: "Number of listing pages to scrape (each page ~ 10-15 companies)"
+        required: false
+        default: "3"
+      max_jobs:
+        description: "Stop after this many jobs printed (0 = no limit)"
+        required: false
+        default: "0"
+  # schedule:
+  #   - cron: '0 */6 * * *'   # every 6 hours
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scraper (prints full verbose job data, saves nothing)
+        env:
+          SCRAPE_PAGES: ${{ github.event.inputs.pages || '3' }}
+          MAX_JOBS: ${{ github.event.inputs.max_jobs || '0' }}
+          REQUEST_DELAY: "1.0"
+        run: python myjobmag_za_scraper.py
