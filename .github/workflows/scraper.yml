@@ -1,4 +1,4 @@
-name: Scraper (Verbose Test)
+name: MyJobMag SA Scraper (Paraphrase + WordPress Post)
 
 # Manual trigger by default. Uncomment the schedule block below once you're
 # happy with the output and want it to run automatically.
@@ -10,11 +10,28 @@ on:
         required: false
         default: "3"
       max_jobs:
-        description: "Stop after this many jobs printed (0 = no limit)"
+        description: "Stop after this many new jobs processed (0 = no limit)"
         required: false
         default: "0"
+      enable_paraphrase:
+        description: "Paraphrase titles/descriptions via Mistral (1 = on, 0 = off)"
+        required: false
+        default: "1"
+      resolve_apply_urls:
+        description: "Follow apply-now redirects to find the real application link (1 = on, 0 = off)"
+        required: false
+        default: "1"
   # schedule:
   #   - cron: '0 */6 * * *'   # every 6 hours
+
+# Prevents two runs from overlapping and racing on the dedup tracker / double
+# posting the same job to WordPress.
+concurrency:
+  group: myjobmag-sa-scraper
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # needed to commit the updated dedup tracker back to the repo
 
 jobs:
   scrape:
@@ -31,9 +48,35 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run scraper (prints full verbose job data, saves nothing)
+      - name: Run scraper (paraphrase + dedupe + post to WordPress)
         env:
           SCRAPE_PAGES: ${{ github.event.inputs.pages || '3' }}
           MAX_JOBS: ${{ github.event.inputs.max_jobs || '0' }}
           REQUEST_DELAY: "1.0"
-        run: python za.py
+          RESOLVE_APPLY_URLS: ${{ github.event.inputs.resolve_apply_urls || '1' }}
+          RESOLVE_DELAY: "0.5"
+          ENABLE_PARAPHRASE: ${{ github.event.inputs.enable_paraphrase || '1' }}
+          WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
+          WP_USERNAME: ${{ secrets.WP_USERNAME }}
+          WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+        run: python myjobmag_sa_scraper.py
+
+      - name: Upload run output (Excel + tracker CSV)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: myjobmag-sa-output-${{ github.run_number }}
+          path: |
+            myjobmag_sa_jobs.xlsx
+            myjobmag_sa_processed.csv
+          if-no-files-found: warn
+
+      - name: Commit updated dedup tracker back to repo
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add myjobmag_sa_processed.csv
+          git diff --cached --quiet || git commit -m "Update MyJobMag SA dedup tracker [skip ci]"
+          git push
