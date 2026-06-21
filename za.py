@@ -41,7 +41,8 @@ except ImportError:
 
 BASE_URL = "https://www.myjobmag.co.za"
 
-SCRAPE_PAGES = int(os.environ.get("SCRAPE_PAGES", "3"))       # how many listing pages to crawl
+SCRAPE_PAGES = int(os.environ.get("SCRAPE_PAGES", "0"))       # how many listing pages to crawl (0 = unlimited, crawl until no more results)
+MAX_LISTING_PAGES_SAFETY = int(os.environ.get("MAX_LISTING_PAGES_SAFETY", "1000"))  # hard safety cap so SCRAPE_PAGES=0 can't loop forever if the site misbehaves      # how many listing pages to crawl
 REQUEST_DELAY = float(os.environ.get("REQUEST_DELAY", "1.0"))  # polite delay between requests, seconds
 MAX_JOBS = int(os.environ.get("MAX_JOBS", "0"))                # 0 = no cap, otherwise stop after N new jobs
 
@@ -916,18 +917,32 @@ def collect_company_page_urls(pages=SCRAPE_PAGES):
     urls = []
     seen = set()
 
-    for i in range(1, pages + 1):
+    unlimited = pages <= 0
+    limit = MAX_LISTING_PAGES_SAFETY if unlimited else pages
+
+    i = 1
+    while i <= limit:
         page_url = BASE_URL if i == 1 else f"{BASE_URL}/page/{i}"
-        log(f"\n{'=' * 80}\nFETCHING LISTING PAGE {i}: {page_url}\n{'=' * 80}")
+        log(f"\n{'=' * 80}\nFETCHING LISTING PAGE {i}{'' if unlimited else f'/{pages}'}: {page_url}\n{'=' * 80}")
 
         try:
             soup = get_soup(page_url)
         except Exception as e:
             log(f"  ERROR fetching listing page {i}: {e}")
+            if unlimited:
+                # On an unlimited run, a fetch error (e.g. 404 past the last
+                # page) is our signal that we've run off the end of the listings.
+                log("  Treating fetch error as end-of-listings, stopping pagination.")
+                break
+            i += 1
             continue
 
         blocks = soup.select("li.job-list-li")
         log(f"  Found {len(blocks)} company/job blocks on this page")
+
+        if not blocks:
+            log("  No job blocks found — reached the end of listings, stopping pagination.")
+            break
 
         for block in blocks:
             h2_a = block.select_one("li.job-info h2 a")
@@ -939,10 +954,13 @@ def collect_company_page_urls(pages=SCRAPE_PAGES):
                 urls.append(full_url)
 
         time.sleep(REQUEST_DELAY)
+        i += 1
+
+    if unlimited and i > limit:
+        log(f"  WARNING: hit MAX_LISTING_PAGES_SAFETY={MAX_LISTING_PAGES_SAFETY} without finding an empty page — stopped as a safety measure.")
 
     log(f"\nTotal unique company/job page URLs collected: {len(urls)}")
     return urls
-
 # =============================================================================
 #  STEP 2 — PARSE A COMPANY/JOB PAGE (handles both multi-job and single-job
 #           templates by looking for ul.job-key-info blocks generically)
@@ -1278,7 +1296,7 @@ def main():
     print(C_HEADER("=" * 80))
     print(C_HEADER("  MYJOBMAG SOUTH AFRICA SCRAPER + MISTRAL PARAPHRASE + WORDPRESS POSTING"))
     print(C_HEADER("=" * 80))
-    print(f"  Scrape pages    : {SCRAPE_PAGES}")
+    print(f"  Scrape pages    : {'unlimited (until empty page)' if SCRAPE_PAGES <= 0 else SCRAPE_PAGES}")
     print(f"  Request delay   : {REQUEST_DELAY}s")
     print(f"  Max new jobs    : {'unlimited' if not MAX_JOBS else MAX_JOBS}")
     print(f"  Resolve apply   : {'✅ enabled' if RESOLVE_APPLY_URLS else '❌ disabled'}")
