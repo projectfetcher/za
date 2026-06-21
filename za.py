@@ -388,33 +388,67 @@ def is_placeholder_logo(url: str) -> bool:
         return True
     return bool(PLACEHOLDER_LOGO_RE.search(url))
 
+SITE_BRAND_RE = re.compile(r"myjobmag", re.I)
+
 def extract_company_logo(soup: BeautifulSoup) -> str:
     """
     Best-effort company logo lookup for a myjobmag.co.za company/job page.
-    Priority: og:image meta tag (myjobmag usually sets the company logo
-    here) > any <img> whose class/id/alt/src mentions "logo".
+    Priority:
+      1. An <img> inside the company-info area (near the company name link)
+         whose class/id/alt/src mentions "logo" or "company".
+      2. Any <img> elsewhere on the page mentioning "logo", excluding the
+         site's own header/nav logo and anything branded "myjobmag".
+      3. og:image meta tag, ONLY if it doesn't look like the site's own
+         banner (not hosted on a myjobmag asset path, not the default share
+         image).
     """
-    og = soup.find("meta", property="og:image") or soup.find("meta", attrs={"name": "og:image"})
-    if og:
-        content = og.get("content", "")
-        if content:
-            cand = clean_logo_url(content)
-            if cand and not is_placeholder_logo(cand):
-                return cand
+    def candidate_from_img(img):
+        src = img.get("src") or img.get("data-src") or img.get("data-lazy-src") or ""
+        cand = clean_logo_url(src)
+        if not cand or is_placeholder_logo(cand):
+            return ""
+        if SITE_BRAND_RE.search(cand):
+            return ""
+        return cand
 
+    # 1. Look near the company name / company-industry block first — this is
+    #    the most reliable spot for the actual employer logo on MyJobMag.
+    company_area = soup.select_one("li.job-industry") or soup.select_one(".company-info") or soup.select_one(".read-left-section")
+    if company_area:
+        for img in company_area.find_all("img"):
+            blob = " ".join(filter(None, [
+                " ".join(img.get("class", []) or []),
+                img.get("id", ""), img.get("alt", ""), img.get("src", ""),
+            ]))
+            if LOGO_KEYWORDS_RE.search(blob) or re.search(r"compan", blob, re.I):
+                cand = candidate_from_img(img)
+                if cand:
+                    return cand
+
+    # 2. Fall back to scanning the whole page for a logo-ish image, but
+    #    explicitly skip header/nav/footer (the site's own logo lives there).
     for img in soup.find_all("img"):
+        if img.find_parent(["header", "nav", "footer"]):
+            continue
         blob = " ".join(filter(None, [
             " ".join(img.get("class", []) or []),
             img.get("id", ""), img.get("alt", ""), img.get("src", ""),
         ]))
         if LOGO_KEYWORDS_RE.search(blob):
-            src = img.get("src") or img.get("data-src") or ""
-            cand = clean_logo_url(src)
-            if cand and not is_placeholder_logo(cand):
+            cand = candidate_from_img(img)
+            if cand:
+                return cand
+
+    # 3. Last resort: og:image, but only if it isn't the site's own banner.
+    og = soup.find("meta", property="og:image") or soup.find("meta", attrs={"name": "og:image"})
+    if og:
+        content = og.get("content", "")
+        if content:
+            cand = clean_logo_url(content)
+            if cand and not is_placeholder_logo(cand) and not SITE_BRAND_RE.search(cand):
                 return cand
 
     return ""
-
 # =============================================================================
 #  NLP TOOLS (lazy init, optional)
 # =============================================================================
