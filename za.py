@@ -3,7 +3,7 @@ import re
 import sys
 import time
 from datetime import datetime
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlsplit, urlunsplit, parse_qsl, urlencode
 
 import requests
 from bs4 import BeautifulSoup
@@ -56,6 +56,14 @@ GENERIC_TITLE_PATTERNS = [
     re.compile(r"^(new )?recruitment at ", re.I),
     re.compile(r"^(trending|active|current|hot) (jobs?|roles?|openings?|vacancies) at ", re.I),
 ]
+
+# Query-string params to strip from resolved apply links because they're
+# tracking noise (MyJobMag, UTM, ad-platform click IDs etc.), not anything
+# the employer's application form actually needs.
+TRACKING_PARAM_PREFIXES = ("utm_",)
+TRACKING_PARAM_EXACT = {
+    "fbclid", "gclid", "msclkid", "mc_cid", "mc_eid", "ref", "referrer",
+}
 
 # Matches a plain email address inside free text job descriptions.
 EMAIL_PATTERN = re.compile(r"[A-Za-z0-9.+_-]+@[A-Za-z0-9-]+\.[A-Za-z0-9.-]+")
@@ -158,6 +166,27 @@ def extract_email(text):
     return m.group(0) if m else ""
 
 
+def strip_tracking_params(url):
+    """Removes tracking query-string params (utm_source=MyJobMag and similar)
+    from a URL so the apply link reported is clean. Leaves any params the
+    employer's site actually needs (e.g. a real job/vacancy id) untouched."""
+    if not url:
+        return url
+    parts = urlsplit(url)
+    if not parts.query:
+        return url
+
+    kept = []
+    for key, value in parse_qsl(parts.query, keep_blank_values=True):
+        key_lower = key.lower()
+        if key_lower.startswith(TRACKING_PARAM_PREFIXES) or key_lower in TRACKING_PARAM_EXACT:
+            continue
+        kept.append((key, value))
+
+    new_query = urlencode(kept)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
+
+
 def _same_site(url):
     try:
         return urlparse(url).netloc == urlparse(BASE_URL).netloc
@@ -212,6 +241,8 @@ def resolve_apply_url(raw_apply_url):
     except requests.RequestException as e:
         log(f"    WARNING: could not resolve apply URL {raw_apply_url}: {e}")
         resolved = ""
+
+    resolved = strip_tracking_params(resolved)
 
     _apply_url_cache[raw_apply_url] = resolved
     if RESOLVE_DELAY:
