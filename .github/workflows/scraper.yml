@@ -60,7 +60,7 @@ jobs:
           WP_USERNAME: ${{ secrets.WP_USERNAME }}
           WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
           MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
-        run: python myjobmag_sa_scraper.py
+        run: python za.py
 
       - name: Upload run output (Excel + tracker CSV)
         if: always()
