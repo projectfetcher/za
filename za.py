@@ -1,32 +1,9 @@
-#!/usr/bin/env python3
-# =============================================================================
-#  MyJobMag South Africa Scraper — Python (verbose console output only)
-#  Site: https://www.myjobmag.co.za
-#
-#  Converted from the Kenya Google Apps Script version. The SA site uses a
-#  different listing/job-detail template than Kenya:
-#    - Listing page: each company block is <li class="job-list-li"> with an
-#      <h2><a> pointing to either:
-#        /jobs/<slug>   -> a "company batch" page that can contain MULTIPLE
-#                          jobs, each in its own <h2 id="jobNNNNNNN"> block
-#                          followed by <ul class="job-key-info"> and
-#                          <div class="job-details">.
-#        /job/<slug>    -> appears to be used for what looks like a single
-#                          standalone job. I don't have a confirmed sample of
-#                          this template, so there's a best-effort fallback
-#                          parser for it below — verify its output and adjust
-#                          selectors if needed once you've run this for real.
-#
-#  This script does NOT write to Google Sheets, WordPress, or any file. It
-#  just prints every job it scrapes to the console in full, verbose detail,
-#  so you can inspect the data before deciding what to do with it.
-# =============================================================================
-
 import os
 import re
 import sys
 import time
 from datetime import datetime
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -41,6 +18,12 @@ SCRAPE_PAGES = int(os.environ.get("SCRAPE_PAGES", "3"))      # how many listing 
 REQUEST_DELAY = float(os.environ.get("REQUEST_DELAY", "1.0"))  # polite delay between requests, seconds
 MAX_JOBS = int(os.environ.get("MAX_JOBS", "0"))               # 0 = no cap, otherwise stop after N jobs printed
 
+# Apply-link resolution: follow the myjobmag.co.za/apply-now/<id> redirect to
+# find the real destination. Each resolution is an extra HTTP request, so it
+# can be turned off (e.g. for a quick test run) by setting RESOLVE_APPLY_URLS=0.
+RESOLVE_APPLY_URLS = os.environ.get("RESOLVE_APPLY_URLS", "1") != "0"
+RESOLVE_DELAY = float(os.environ.get("RESOLVE_DELAY", "0.5"))  # polite delay between resolve requests
+
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -51,6 +34,14 @@ HEADERS = {
 }
 
 REQUEST_TIMEOUT = 25
+
+# Reuse one TCP/TLS connection where possible for every request this run makes.
+SESSION = requests.Session()
+SESSION.headers.update(HEADERS)
+
+# Caches the raw apply-now URL -> resolved real URL, so if the same apply-now
+# link is ever seen twice we don't hit it again.
+_apply_url_cache = {}
 
 # Generic "collection" titles we don't want to treat as a real job title.
 # Only used in the single-job fallback parser, where the title comes from <h1>.
@@ -66,6 +57,23 @@ GENERIC_TITLE_PATTERNS = [
     re.compile(r"^(trending|active|current|hot) (jobs?|roles?|openings?|vacancies) at ", re.I),
 ]
 
+# Matches a plain email address inside free text job descriptions.
+EMAIL_PATTERN = re.compile(r"[A-Za-z0-9.+_-]+@[A-Za-z0-9-]+\.[A-Za-z0-9.-]+")
+
+# Matches <meta http-equiv="refresh" content="0;url=https://...">
+META_REFRESH_PATTERN = re.compile(
+    r'<meta[^>]+http-equiv=["\']refresh["\'][^>]*content=["\'][^"\'>]*url=([^"\'>]+)',
+    re.I,
+)
+
+# Matches common JS redirect idioms:
+#   window.location = "..."   window.location.href = "..."
+#   window.location.replace("...")   location.replace("...")
+JS_REDIRECT_PATTERN = re.compile(
+    r'(?:window\.)?location(?:\.href)?\s*(?:=\s*|\.replace\(\s*)["\']([^"\']+)["\']',
+    re.I,
+)
+
 
 # -----------------------------------------------------------------------------
 # HELPERS
@@ -76,7 +84,7 @@ def log(msg):
 
 
 def get_soup(url):
-    resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+    resp = SESSION.get(url, timeout=REQUEST_TIMEOUT)
     resp.raise_for_status()
     resp.encoding = resp.encoding or "utf-8"
     return BeautifulSoup(resp.text, "lxml")
@@ -140,6 +148,93 @@ def absolute_url(href):
     if not href:
         return ""
     return href if href.startswith("http") else BASE_URL + href
+
+
+def extract_email(text):
+    """Returns the first email address found in the given text, or ''."""
+    if not text:
+        return ""
+    m = EMAIL_PATTERN.search(text)
+    return m.group(0) if m else ""
+
+
+def _same_site(url):
+    try:
+        return urlparse(url).netloc == urlparse(BASE_URL).netloc
+    except Exception:
+        return False
+
+
+def _find_html_redirect_target(html, current_url):
+    """Looks for a meta-refresh or simple JS redirect inside an HTML page and
+    returns the absolute target URL, or '' if none is found."""
+    m = META_REFRESH_PATTERN.search(html)
+    if not m:
+        m = JS_REDIRECT_PATTERN.search(html)
+    if not m:
+        return ""
+    target = m.group(1).strip().strip("'\"")
+    return urljoin(current_url, target)
+
+
+def resolve_apply_url(raw_apply_url):
+    """Follows a myjobmag.co.za/apply-now/<id> link to find the real employer
+    application page. Returns the resolved URL, or '' if it can't be resolved
+    (no link, request failure, or it never leaves myjobmag.co.za)."""
+    if not raw_apply_url:
+        return ""
+
+    if raw_apply_url in _apply_url_cache:
+        return _apply_url_cache[raw_apply_url]
+
+    resolved = ""
+    try:
+        resp = SESSION.get(raw_apply_url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+        final_url = resp.url
+
+        if final_url and not _same_site(final_url):
+            # Plain HTTP redirect already landed us off myjobmag.co.za - done.
+            resolved = final_url
+        else:
+            # Either no redirect happened, or it redirected to another page
+            # still on myjobmag.co.za. Check the HTML for a meta-refresh or
+            # JS redirect that requests.get() wouldn't have followed.
+            html_target = _find_html_redirect_target(resp.text, final_url)
+            if html_target:
+                resolved = html_target
+            elif final_url and final_url != raw_apply_url:
+                # It moved somewhere, even if still on-site - report it rather
+                # than silently dropping it, since it's still more useful
+                # than the bare tracking link.
+                resolved = final_url
+            else:
+                resolved = ""
+    except requests.RequestException as e:
+        log(f"    WARNING: could not resolve apply URL {raw_apply_url}: {e}")
+        resolved = ""
+
+    _apply_url_cache[raw_apply_url] = resolved
+    if RESOLVE_DELAY:
+        time.sleep(RESOLVE_DELAY)
+    return resolved
+
+
+def resolve_application_contact(raw_apply_url, description):
+    """Returns a dict with the best application info we can find:
+      {'apply_url': <resolved real link or ''>,
+       'apply_email': <email scraped from description or ''>,
+       'apply_raw': <original myjobmag.co.za apply-now link, for reference>}
+    Resolution order: real redirect target first, then an email address found
+    in the job description, otherwise both come back empty."""
+    result = {"apply_url": "", "apply_email": "", "apply_raw": raw_apply_url}
+
+    if raw_apply_url and RESOLVE_APPLY_URLS:
+        result["apply_url"] = resolve_apply_url(raw_apply_url)
+
+    if not result["apply_url"]:
+        result["apply_email"] = extract_email(description)
+
+    return result
 
 
 # -----------------------------------------------------------------------------
@@ -286,7 +381,10 @@ def parse_job_page(url):
             details_div = ul.find_next_sibling("div", class_="job-details")
             description = clean_description(clean_text(details_div))
 
-            apply_url = apply_links.get(numeric_id, "") if numeric_id else single_apply_fallback
+            raw_apply_url = apply_links.get(numeric_id, "") if numeric_id else single_apply_fallback
+
+            log(f"    Resolving apply link for '{title}'...")
+            application = resolve_application_contact(raw_apply_url, description)
 
             jobs.append({
                 "title": title,
@@ -300,7 +398,9 @@ def parse_job_page(url):
                 "posted_date": posted_date_raw,
                 "deadline": deadline,
                 "description": description,
-                "apply_url": apply_url,
+                "apply_url": application["apply_url"],
+                "apply_email": application["apply_email"],
+                "apply_raw": application["apply_raw"],
                 "company_name": company_name,
                 "company_url": company_url,
                 "company_blurb": company_blurb,
@@ -332,7 +432,16 @@ def print_job_verbose(index, job):
     print(f"Field           : {job['field']}")
     print(f"Posted Date     : {job['posted_date']}")
     print(f"Deadline        : {job['deadline']}")
-    print(f"Apply URL       : {job['apply_url']}")
+
+    if job["apply_url"]:
+        print(f"Apply URL       : {job['apply_url']}")
+    elif job["apply_email"]:
+        print(f"Apply Email     : {job['apply_email']}")
+    else:
+        print("Apply URL       : (not found - check source page)")
+    if job["apply_raw"]:
+        print(f"  (MyJobMag tracking link was: {job['apply_raw']})")
+
     print(f"Source Page     : {job['source_page']}")
     if job["company_blurb"]:
         print(f"Company Blurb   : {job['company_blurb']}")
@@ -348,6 +457,7 @@ def main():
     start_time = datetime.now()
     log(f"SCRAPE RUN STARTED: {start_time.isoformat()}")
     log(f"SCRAPE_PAGES={SCRAPE_PAGES}  REQUEST_DELAY={REQUEST_DELAY}  MAX_JOBS={MAX_JOBS or 'unlimited'}")
+    log(f"RESOLVE_APPLY_URLS={RESOLVE_APPLY_URLS}  RESOLVE_DELAY={RESOLVE_DELAY}")
 
     page_urls = collect_company_page_urls(SCRAPE_PAGES)
 
