@@ -8,7 +8,7 @@ on:
       pages:
         description: "Number of listing pages to scrape (each page ~ 10-15 companies)"
         required: false
-        default: "3"
+        default: "0"
       max_jobs:
         description: "Stop after this many new jobs processed (0 = no limit)"
         required: false
@@ -50,7 +50,7 @@ jobs:
 
       - name: Run scraper (paraphrase + dedupe + post to WordPress)
         env:
-          SCRAPE_PAGES: ${{ github.event.inputs.pages || '3' }}
+          SCRAPE_PAGES: ${{ github.event.inputs.pages || '0' }}
           MAX_JOBS: ${{ github.event.inputs.max_jobs || '0' }}
           REQUEST_DELAY: "1.0"
           RESOLVE_APPLY_URLS: ${{ github.event.inputs.resolve_apply_urls || '1' }}
