@@ -41,7 +41,7 @@ except ImportError:
 
 BASE_URL = "https://www.myjobmag.co.za"
 
-SCRAPE_PAGES = int(os.environ.get("SCRAPE_PAGES", "0"))       # how many listing pages to crawl (0 = unlimited, crawl until no more results)
+SCRAPE_PAGES = int(os.environ.get("SCRAPE_PAGES", "10"))       # how many listing pages to crawl (0 = unlimited, crawl until no more results)
 MAX_LISTING_PAGES_SAFETY = int(os.environ.get("MAX_LISTING_PAGES_SAFETY", "1000"))  # hard safety cap so SCRAPE_PAGES=0 can't loop forever if the site misbehaves      # how many listing pages to crawl
 REQUEST_DELAY = float(os.environ.get("REQUEST_DELAY", "1.0"))  # polite delay between requests, seconds
 MAX_JOBS = int(os.environ.get("MAX_JOBS", "0"))                # 0 = no cap, otherwise stop after N new jobs
@@ -98,7 +98,7 @@ HEADERS = {
     "Accept-Charset": "utf-8",
 }
 
-REQUEST_TIMEOUT = 25
+#REQUEST_TIMEOUT = 25
 
 # Reuse one TCP/TLS connection where possible for every request this run makes.
 SESSION = requests.Session()
@@ -226,7 +226,7 @@ def clean_text(el):
 # =============================================================================
 
 def get_soup(url):
-    resp = SESSION.get(url, timeout=REQUEST_TIMEOUT)
+    resp = SESSION.get(url)
     resp.raise_for_status()
     resp.encoding = resp.encoding or "utf-8"
     return BeautifulSoup(resp.text, "lxml")
