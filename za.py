@@ -1,5 +1,6 @@
 import os
 import re
+import csv
 import sys
 import time
 import json
@@ -19,7 +20,7 @@ try:
 except ImportError:
     pass
 
-# Optional heavy deps used for Excel export / duplicate tracking.
+# Optional heavy deps used for Excel export only.
 try:
     import pandas as pd
     import openpyxl
@@ -41,21 +42,23 @@ except ImportError:
 
 BASE_URL = "https://www.myjobmag.co.za"
 
-SCRAPE_PAGES = int(os.environ.get("SCRAPE_PAGES", "10"))       # how many listing pages to crawl (0 = unlimited, crawl until no more results)
-MAX_LISTING_PAGES_SAFETY = int(os.environ.get("MAX_LISTING_PAGES_SAFETY", "1000"))  # hard safety cap so SCRAPE_PAGES=0 can't loop forever if the site misbehaves      # how many listing pages to crawl
-REQUEST_DELAY = float(os.environ.get("REQUEST_DELAY", "1.0"))  # polite delay between requests, seconds
-MAX_JOBS = int(os.environ.get("MAX_JOBS", "0"))                # 0 = no cap, otherwise stop after N new jobs
+SCRAPE_PAGES = int(os.environ.get("SCRAPE_PAGES", "10"))
+MAX_LISTING_PAGES_SAFETY = int(os.environ.get("MAX_LISTING_PAGES_SAFETY", "1000"))
+REQUEST_DELAY = float(os.environ.get("REQUEST_DELAY", "1.0"))
+MAX_JOBS = int(os.environ.get("MAX_JOBS", "0"))
+REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "25"))
 
-# Apply-link resolution: follow the myjobmag.co.za/apply-now/<id> redirect to
-# find the real destination. Each resolution is an extra HTTP request, so it
-# can be turned off (e.g. for a quick test run) by setting RESOLVE_APPLY_URLS=0.
 RESOLVE_APPLY_URLS = os.environ.get("RESOLVE_APPLY_URLS", "1") != "0"
-RESOLVE_DELAY = float(os.environ.get("RESOLVE_DELAY", "0.5"))  # polite delay between resolve requests
+RESOLVE_DELAY = float(os.environ.get("RESOLVE_DELAY", "0.5"))
 
 OUTPUT_FILE = "myjobmag_sa_jobs.xlsx"
 PROCESSED_IDS_FILE = "myjobmag_sa_processed.csv"
 
-# ── WordPress (secrets via environment variables — see header docstring) ────
+# CSV column names — defined once so _init_tracker, load, and upsert all agree.
+_TRACKER_FIELDS = ["Job ID", "Job URL", "Job Title", "Company Name",
+                   "Status", "Timestamp", "WP ID"]
+
+# ── WordPress ────────────────────────────────────────────────────────────────
 WP_URL      = os.environ.get("WP_BASE_URL", "")
 WP_USER     = os.environ.get("WP_USERNAME", "")
 WP_PASSWORD = os.environ.get("WP_APP_PASSWORD", "")
@@ -63,14 +66,14 @@ WP_BASE      = WP_URL.rstrip("/")
 WP_JOBS_URL  = f"{WP_BASE}/job-listings"
 WP_MEDIA_URL = f"{WP_BASE}/media"
 
-# ── Mistral (secret via environment variable — see header docstring) ────────
+# ── Mistral ──────────────────────────────────────────────────────────────────
 MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "")
 MISTRAL_MODEL   = "mistral-small-latest"
 MISTRAL_URL     = "https://api.mistral.ai/v1/chat/completions"
 
-ENABLE_PARAPHRASE = True   # set False to skip paraphrasing entirely
+ENABLE_PARAPHRASE = True
 
-# ── Startup checks: warn (don't crash) if secrets are missing ───────────────
+# ── Startup warnings ─────────────────────────────────────────────────────────
 for _var, _val, _feature in [
     ("MISTRAL_API_KEY", MISTRAL_API_KEY, "paraphrasing"),
     ("WP_USERNAME",     WP_USER,         "WordPress posting"),
@@ -98,14 +101,9 @@ HEADERS = {
     "Accept-Charset": "utf-8",
 }
 
-#REQUEST_TIMEOUT = 25
-
-# Reuse one TCP/TLS connection where possible for every request this run makes.
 SESSION = requests.Session()
 SESSION.headers.update(HEADERS)
 
-# Caches the raw apply-now URL -> resolved real URL, so if the same apply-now
-# link is ever seen twice we don't hit it again.
 _apply_url_cache = {}
 
 # =============================================================================
@@ -113,7 +111,7 @@ _apply_url_cache = {}
 # =============================================================================
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log_ = logging.getLogger(__name__)   # logger instance (.info/.warning/.error)
+log_ = logging.getLogger(__name__)
 
 _USE_COLOUR = sys.stdout.isatty()
 
@@ -130,11 +128,8 @@ C_BLUE    = lambda t: _c("1;34",  t)
 C_DIVIDER = lambda: _c("2", "─" * 80)
 
 def log(msg):
-    """Plain console print (kept distinct from the log_ logger instance)."""
     print(msg, flush=True)
 
-# Generic "collection" titles we don't want to treat as a real job title.
-# Only used in the single-job fallback parser, where the title comes from <h1>.
 GENERIC_TITLE_PATTERNS = [
     re.compile(r"^fresh jobs? at ", re.I),
     re.compile(r"^latest (jobs?|recruitment|openings?) at ", re.I),
@@ -147,33 +142,23 @@ GENERIC_TITLE_PATTERNS = [
     re.compile(r"^(trending|active|current|hot) (jobs?|roles?|openings?|vacancies) at ", re.I),
 ]
 
-# Query-string params to strip from resolved apply links because they're
-# tracking noise (MyJobMag, UTM, ad-platform click IDs etc.), not anything
-# the employer's application form actually needs.
 TRACKING_PARAM_PREFIXES = ("utm_",)
 TRACKING_PARAM_EXACT = {
     "fbclid", "gclid", "msclkid", "mc_cid", "mc_eid", "ref", "referrer",
 }
 
-# Matches a plain email address inside free text job descriptions.
 EMAIL_PATTERN = re.compile(r"[A-Za-z0-9.+_-]+@[A-Za-z0-9-]+\.[A-Za-z0-9.-]+")
 
-# Matches <meta http-equiv="refresh" content="0;url=https://...">
 META_REFRESH_PATTERN = re.compile(
     r'<meta[^>]+http-equiv=["\']refresh["\'][^>]*content=["\'][^"\'>]*url=([^"\'>]+)',
     re.I,
 )
 
-# Matches common JS redirect idioms:
-#   window.location = "..."   window.location.href = "..."
-#   window.location.replace("...")   location.replace("...")
 JS_REDIRECT_PATTERN = re.compile(
     r'(?:window\.)?location(?:\.href)?\s*(?:=\s*|\.replace\(\s*)["\']([^"\']+)["\']',
     re.I,
 )
 
-# UI boilerplate phrases that leak into job-details text and aren't part of
-# the actual job content. Stripped before printing.
 BOILERPLATE_PATTERNS = [
     re.compile(r"go to method of application\s*[»>]*", re.I),
     re.compile(r"Read more about this company", re.I),
@@ -195,7 +180,6 @@ def _fix_mojibake(text: str) -> str:
     return text
 
 def sanitize_text(text, is_url=False) -> str:
-    """Light cleanup pass used right before sending a field to WordPress."""
     if not isinstance(text, str):
         text = str(text) if (text is not None and str(text) not in ("nan", "None", "NaN")) else ""
     text = text.strip()
@@ -226,13 +210,12 @@ def clean_text(el):
 # =============================================================================
 
 def get_soup(url):
-    resp = SESSION.get(url)
+    resp = SESSION.get(url, timeout=REQUEST_TIMEOUT)
     resp.raise_for_status()
     resp.encoding = resp.encoding or "utf-8"
     return BeautifulSoup(resp.text, "lxml")
 
 def strip_company_suffix(title):
-    """Strip ' at Company Name' suffix, used only by the single-job fallback parser."""
     if not title:
         return title
     m = re.match(r"^(.+?)\s+at\s+.+$", title, re.I)
@@ -242,7 +225,6 @@ def is_generic_title(title):
     return any(p.search(title) for p in GENERIC_TITLE_PATTERNS)
 
 def parse_posted_date(date_str):
-    """Parses strings like 'Jun 20, 2026' -> datetime, or None on failure."""
     if not date_str:
         return None
     try:
@@ -256,7 +238,7 @@ def add_three_months(dt):
     month = dt.month - 1 + 3
     year = dt.year + month // 12
     month = month % 12 + 1
-    day = min(dt.day, 28)  # safe day to avoid month-length issues
+    day = min(dt.day, 28)
     return datetime(year, month, day).strftime("%Y-%m-%d")
 
 def absolute_url(href):
@@ -265,29 +247,23 @@ def absolute_url(href):
     return href if href.startswith("http") else BASE_URL + href
 
 def extract_email(text):
-    """Returns the first email address found in the given text, or ''."""
     if not text:
         return ""
     m = EMAIL_PATTERN.search(text)
     return m.group(0) if m else ""
 
 def strip_tracking_params(url):
-    """Removes tracking query-string params (utm_source=MyJobMag and similar)
-    from a URL so the apply link reported is clean. Leaves any params the
-    employer's site actually needs (e.g. a real job/vacancy id) untouched."""
     if not url:
         return url
     parts = urlsplit(url)
     if not parts.query:
         return url
-
     kept = []
     for key, value in parse_qsl(parts.query, keep_blank_values=True):
         key_lower = key.lower()
         if key_lower.startswith(TRACKING_PARAM_PREFIXES) or key_lower in TRACKING_PARAM_EXACT:
             continue
         kept.append((key, value))
-
     new_query = urlencode(kept)
     return urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
 
@@ -298,8 +274,6 @@ def _same_site(url):
         return False
 
 def _find_html_redirect_target(html, current_url):
-    """Looks for a meta-refresh or simple JS redirect inside an HTML page and
-    returns the absolute target URL, or '' if none is found."""
     m = META_REFRESH_PATTERN.search(html)
     if not m:
         m = JS_REDIRECT_PATTERN.search(html)
@@ -309,63 +283,39 @@ def _find_html_redirect_target(html, current_url):
     return urljoin(current_url, target)
 
 def resolve_apply_url(raw_apply_url):
-    """Follows a myjobmag.co.za/apply-now/<id> link to find the real employer
-    application page. Returns the resolved URL, or '' if it can't be resolved
-    (no link, request failure, or it never leaves myjobmag.co.za)."""
     if not raw_apply_url:
         return ""
-
     if raw_apply_url in _apply_url_cache:
         return _apply_url_cache[raw_apply_url]
-
     resolved = ""
     try:
         resp = SESSION.get(raw_apply_url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
         final_url = resp.url
-
         if final_url and not _same_site(final_url):
-            # Plain HTTP redirect already landed us off myjobmag.co.za - done.
             resolved = final_url
         else:
-            # Either no redirect happened, or it redirected to another page
-            # still on myjobmag.co.za. Check the HTML for a meta-refresh or
-            # JS redirect that requests.get() wouldn't have followed.
             html_target = _find_html_redirect_target(resp.text, final_url)
             if html_target:
                 resolved = html_target
             elif final_url and final_url != raw_apply_url:
-                # It moved somewhere, even if still on-site - report it rather
-                # than silently dropping it, since it's still more useful
-                # than the bare tracking link.
                 resolved = final_url
             else:
                 resolved = ""
     except requests.RequestException as e:
         log(f"    WARNING: could not resolve apply URL {raw_apply_url}: {e}")
         resolved = ""
-
     resolved = strip_tracking_params(resolved)
-
     _apply_url_cache[raw_apply_url] = resolved
     if RESOLVE_DELAY:
         time.sleep(RESOLVE_DELAY)
     return resolved
 
 def resolve_application_contact(raw_apply_url, description):
-    """Returns a dict with the best application info we can find:
-      {'apply_url': <resolved real link or ''>,
-       'apply_email': <email scraped from description or ''>,
-       'apply_raw': <original myjobmag.co.za apply-now link, for reference>}
-    Resolution order: real redirect target first, then an email address found
-    in the job description, otherwise both come back empty."""
     result = {"apply_url": "", "apply_email": "", "apply_raw": raw_apply_url}
-
     if raw_apply_url and RESOLVE_APPLY_URLS:
         result["apply_url"] = resolve_apply_url(raw_apply_url)
-
     if not result["apply_url"]:
         result["apply_email"] = extract_email(description)
-
     return result
 
 # =============================================================================
@@ -391,17 +341,6 @@ def is_placeholder_logo(url: str) -> bool:
 SITE_BRAND_RE = re.compile(r"myjobmag", re.I)
 
 def extract_company_logo(soup: BeautifulSoup) -> str:
-    """
-    Best-effort company logo lookup for a myjobmag.co.za company/job page.
-    Priority:
-      1. An <img> inside the company-info area (near the company name link)
-         whose class/id/alt/src mentions "logo" or "company".
-      2. Any <img> elsewhere on the page mentioning "logo", excluding the
-         site's own header/nav logo and anything branded "myjobmag".
-      3. og:image meta tag, ONLY if it doesn't look like the site's own
-         banner (not hosted on a myjobmag asset path, not the default share
-         image).
-    """
     def candidate_from_img(img):
         src = img.get("src") or img.get("data-src") or img.get("data-lazy-src") or ""
         cand = clean_logo_url(src)
@@ -411,8 +350,6 @@ def extract_company_logo(soup: BeautifulSoup) -> str:
             return ""
         return cand
 
-    # 1. Look near the company name / company-industry block first — this is
-    #    the most reliable spot for the actual employer logo on MyJobMag.
     company_area = soup.select_one("li.job-industry") or soup.select_one(".company-info") or soup.select_one(".read-left-section")
     if company_area:
         for img in company_area.find_all("img"):
@@ -425,8 +362,6 @@ def extract_company_logo(soup: BeautifulSoup) -> str:
                 if cand:
                     return cand
 
-    # 2. Fall back to scanning the whole page for a logo-ish image, but
-    #    explicitly skip header/nav/footer (the site's own logo lives there).
     for img in soup.find_all("img"):
         if img.find_parent(["header", "nav", "footer"]):
             continue
@@ -439,7 +374,6 @@ def extract_company_logo(soup: BeautifulSoup) -> str:
             if cand:
                 return cand
 
-    # 3. Last resort: og:image, but only if it isn't the site's own banner.
     og = soup.find("meta", property="og:image") or soup.find("meta", attrs={"name": "og:image"})
     if og:
         content = og.get("content", "")
@@ -449,6 +383,7 @@ def extract_company_logo(soup: BeautifulSoup) -> str:
                 return cand
 
     return ""
+
 # =============================================================================
 #  NLP TOOLS (lazy init, optional)
 # =============================================================================
@@ -749,45 +684,75 @@ def paraphrase_company(text: str) -> str:
         return clean
 
 # =============================================================================
-#  DUPLICATE TRACKER (persists across runs)
+#  DUPLICATE TRACKER — pure stdlib csv, NO pandas dependency
 # =============================================================================
 
 def _init_tracker():
-    if not _XLSX_AVAILABLE:
-        return
+    """Create the CSV with headers if it doesn't already exist."""
     if not os.path.exists(PROCESSED_IDS_FILE):
-        pd.DataFrame(columns=[
-            "Job ID", "Job URL", "Job Title", "Company Name",
-            "Status", "Timestamp", "WP ID",
-        ]).to_csv(PROCESSED_IDS_FILE, index=False)
+        try:
+            with open(PROCESSED_IDS_FILE, "w", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow(_TRACKER_FIELDS)
+            log_.info(f"Tracker file created: {PROCESSED_IDS_FILE}")
+        except Exception as e:
+            log_.error(f"Could not create tracker file {PROCESSED_IDS_FILE}: {e}")
 
 def load_processed_ids() -> tuple:
-    if not _XLSX_AVAILABLE:
-        log_.warning("pandas not installed — duplicate tracking is in-run only, not persisted")
-        return set(), set()
+    """Returns (set of job IDs, set of job URLs) already in the tracker."""
     _init_tracker()
-    df = pd.read_csv(PROCESSED_IDS_FILE)
-    return (
-        set(df["Job ID"].fillna("").astype(str)),
-        set(df.get("Job URL", pd.Series()).fillna("").astype(str)),
-    )
+    ids, urls = set(), set()
+    try:
+        with open(PROCESSED_IDS_FILE, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                if row.get("Job ID"):
+                    ids.add(row["Job ID"].strip())
+                if row.get("Job URL"):
+                    urls.add(row["Job URL"].strip())
+    except Exception as e:
+        log_.error(f"Could not read tracker file: {e}")
+    return ids, urls
 
 def _upsert_row(job_id: str, updates: dict):
-    if not _XLSX_AVAILABLE:
-        return
+    """
+    Insert or update a row in the CSV tracker.
+    Uses only the stdlib csv module — no pandas required.
+    """
     _init_tracker()
-    df   = pd.read_csv(PROCESSED_IDS_FILE)
-    mask = df["Job ID"].astype(str) == str(job_id)
-    if mask.any():
-        for col, val in updates.items():
-            if col in df.columns:
-                df.loc[mask, col] = val
-        df.loc[mask, "Timestamp"] = datetime.now().isoformat()
-    else:
-        row = {"Job ID": job_id, "Timestamp": datetime.now().isoformat()}
-        row.update(updates)
-        df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-    df.to_csv(PROCESSED_IDS_FILE, index=False)
+    rows = []
+
+    # Read existing rows
+    try:
+        with open(PROCESSED_IDS_FILE, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+    except Exception as e:
+        log_.error(f"Tracker read error: {e}")
+        rows = []
+
+    # Update existing row or append new one
+    found = False
+    for row in rows:
+        if row.get("Job ID", "").strip() == str(job_id):
+            row.update(updates)
+            row["Timestamp"] = datetime.now().isoformat()
+            found = True
+            break
+
+    if not found:
+        new_row = {k: "" for k in _TRACKER_FIELDS}
+        new_row["Job ID"]    = str(job_id)
+        new_row["Timestamp"] = datetime.now().isoformat()
+        new_row.update(updates)
+        rows.append(new_row)
+
+    # Write back
+    try:
+        with open(PROCESSED_IDS_FILE, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=_TRACKER_FIELDS, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
+    except Exception as e:
+        log_.error(f"Tracker write error: {e}")
 
 def make_job_id(job_url: str, title: str = "", company: str = "") -> str:
     if job_url:
@@ -796,14 +761,20 @@ def make_job_id(job_url: str, title: str = "", company: str = "") -> str:
     return hashlib.md5(seed.encode()).hexdigest()[:16]
 
 def mark_scraped(job_id, job_url, title, company):
-    _upsert_row(job_id, {"Job URL": job_url, "Job Title": title,
-                          "Company Name": company, "Status": "scraped"})
+    log_.info(f"Tracker → scraped: {job_id} | {title}")
+    _upsert_row(job_id, {
+        "Job URL":      job_url,
+        "Job Title":    title,
+        "Company Name": company,
+        "Status":       "scraped",
+        "WP ID":        "",
+    })
 
 def mark_paraphrased(job_id):
     _upsert_row(job_id, {"Status": "paraphrased"})
 
 def mark_posted(job_id, wp_id, wp_url):
-    _upsert_row(job_id, {"Status": "posted", "WP ID": wp_id})
+    _upsert_row(job_id, {"Status": "posted", "WP ID": str(wp_id)})
 
 def mark_failed(job_id, reason):
     _upsert_row(job_id, {"Status": f"failed|{reason}"})
@@ -964,8 +935,6 @@ def collect_company_page_urls(pages=SCRAPE_PAGES):
         except Exception as e:
             log(f"  ERROR fetching listing page {i}: {e}")
             if unlimited:
-                # On an unlimited run, a fetch error (e.g. 404 past the last
-                # page) is our signal that we've run off the end of the listings.
                 log("  Treating fetch error as end-of-listings, stopping pagination.")
                 break
             i += 1
@@ -991,18 +960,16 @@ def collect_company_page_urls(pages=SCRAPE_PAGES):
         i += 1
 
     if unlimited and i > limit:
-        log(f"  WARNING: hit MAX_LISTING_PAGES_SAFETY={MAX_LISTING_PAGES_SAFETY} without finding an empty page — stopped as a safety measure.")
+        log(f"  WARNING: hit MAX_LISTING_PAGES_SAFETY={MAX_LISTING_PAGES_SAFETY} without finding an empty page.")
 
     log(f"\nTotal unique company/job page URLs collected: {len(urls)}")
     return urls
+
 # =============================================================================
-#  STEP 2 — PARSE A COMPANY/JOB PAGE (handles both multi-job and single-job
-#           templates by looking for ul.job-key-info blocks generically)
+#  STEP 2 — PARSE A COMPANY/JOB PAGE
 # =============================================================================
 
 def extract_company_blurb(printable, first_h2):
-    """Best-effort extraction of the intro company description text that sits
-    above the first job block inside #printable."""
     if printable is None:
         return ""
     texts = []
@@ -1025,11 +992,6 @@ def extract_company_blurb(printable, first_h2):
     return re.sub(r"\s+", " ", " ".join(texts)).strip()
 
 def parse_job_page(url):
-    """Returns a list of job dicts scraped from a single company/job page URL.
-    Handles the confirmed multi-job template (multiple <h2 id="jobNNN">
-    blocks) and falls back to a single-job interpretation if no such blocks
-    are found."""
-
     soup = get_soup(url)
     printable = soup.select_one("#printable")
 
@@ -1041,7 +1003,6 @@ def parse_job_page(url):
     company_name = re.sub(r"^View Jobs at\s*", "", company_name, flags=re.I).strip()
     company_url = absolute_url(company_a["href"]) if company_a and company_a.get("href") else ""
 
-    # Company logo: shared across every job found on this page.
     company_logo = extract_company_logo(soup)
 
     posted_date_raw = clean_text(soup.select_one("#posted-date"))
@@ -1085,7 +1046,6 @@ def parse_job_page(url):
                 job_url = absolute_url(a["href"]) if a and a.get("href") else url
                 numeric_id = re.sub(r"\D", "", h2.get("id", ""))
             else:
-                # Fallback: no per-job <h2>, treat the whole page as one job
                 title = strip_company_suffix(page_title_raw)
                 job_url = url
                 if is_generic_title(page_title_raw):
@@ -1102,7 +1062,6 @@ def parse_job_page(url):
                 if key:
                     info[key] = val
 
-            # Best-effort salary extraction, when MyJobMag publishes it.
             salary = ""
             for key in ("Salary", "Salary Range", "Pay", "Remuneration"):
                 if info.get(key):
@@ -1145,20 +1104,13 @@ def parse_job_page(url):
     return jobs
 
 # =============================================================================
-#  STEP 3 — DEDUPLICATE + PARAPHRASE  (turns a raw scraped job into the
-#           standardized, WordPress-ready / Excel-ready job dict)
+#  STEP 3 — DEDUPLICATE + PARAPHRASE
 # =============================================================================
 
 def process_job(raw_job: dict, processed_ids: set, processed_urls: set, seen_content: set):
-    """
-    Applies persistent + in-run duplicate detection, then paraphrases the
-    title/description/company blurb via Mistral, and returns the
-    standardized job dict ready for WordPress posting / Excel export.
-    Returns None if the job was a duplicate (and should be skipped).
-    """
-    job_url = raw_job.get("job_url", "")
-    title   = raw_job.get("title", "")
-    company = raw_job.get("company_name", "")
+    job_url  = raw_job.get("job_url", "")
+    title    = raw_job.get("title", "")
+    company  = raw_job.get("company_name", "")
     location = raw_job.get("location") or raw_job.get("city", "")
 
     job_id = make_job_id(job_url, title, company)
@@ -1173,6 +1125,7 @@ def process_job(raw_job: dict, processed_ids: set, processed_urls: set, seen_con
         return None
     seen_content.add(fingerprint)
 
+    # Write to CSV immediately on scrape — before paraphrasing or posting.
     mark_scraped(job_id, job_url, title, company)
     processed_ids.add(job_id)
     processed_urls.add(job_url)
@@ -1198,8 +1151,6 @@ def process_job(raw_job: dict, processed_ids: set, processed_urls: set, seen_con
     apply_email = raw_job.get("apply_email", "")
     application = apply_url or apply_email
 
-    # Best-effort company website: derive root domain from the resolved
-    # apply URL, when that URL actually left myjobmag.co.za.
     company_website = ""
     if apply_url:
         try:
@@ -1212,14 +1163,11 @@ def process_job(raw_job: dict, processed_ids: set, processed_urls: set, seen_con
     apply_method = "resolved_redirect" if apply_url else ("description_email" if apply_email else "not_found")
 
     return {
-        # Paraphrased fields
         "jobTitle":          paraphrased_title,
         "jobDescription":    paraphrased_desc,
         "companyDetails":    paraphrased_blurb,
-        # Original fields (audit / duplicate detection)
         "originalTitle":     title,
         "originalDesc":      description,
-        # Structured fields
         "jobType":           raw_job.get("job_type", ""),
         "jobQualifications": raw_job.get("qualification", ""),
         "jobExperience":     raw_job.get("experience", ""),
@@ -1341,6 +1289,7 @@ def main():
     print(f"  Started         : {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(C_HEADER("=" * 80))
 
+    # Create CSV tracker on startup (no pandas needed)
     _init_tracker()
     processed_ids, processed_urls = load_processed_ids()
     print(f"  Tracker loaded: {len(processed_ids)} previously processed job IDs\n")
@@ -1418,7 +1367,7 @@ def main():
     print(f"  {C_LABEL('Errors')}                     : {C_RED(str(errors)) if errors else '0'}")
     print(f"  {C_LABEL('Duration')}                   : ~{duration:.1f} min")
     print(f"  {C_LABEL('Output file')}                : {OUTPUT_FILE}")
-    print(f"  {C_LABEL('Tracker file')}                : {PROCESSED_IDS_FILE}")
+    print(f"  {C_LABEL('Tracker file')}               : {PROCESSED_IDS_FILE}")
 
     if jobs_out:
         with_apply = sum(1 for j in jobs_out if j.get("application"))
