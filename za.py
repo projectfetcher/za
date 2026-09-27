@@ -58,7 +58,7 @@ PROCESSED_IDS_FILE = "myjobmag_sa_processed.csv"
 _TRACKER_FIELDS = ["Job ID", "Job URL", "Job Title", "Company Name",
                    "Status", "Timestamp", "WP ID"]
 
-# ── WordPress ────────────────────────────────────────────────────────────────
+# ── WordPress (secrets via environment variables — see header docstring) ────
 WP_URL      = os.environ.get("WP_BASE_URL", "")
 WP_USER     = os.environ.get("WP_USERNAME", "")
 WP_PASSWORD = os.environ.get("WP_APP_PASSWORD", "")
@@ -75,15 +75,37 @@ MISTRAL_URL     = "https://api.mistral.ai/v1/chat/completions"
 ENABLE_PARAPHRASE = True
 
 # ── Startup warnings ─────────────────────────────────────────────────────────
+# FIX: INTERNAL_BOT_KEY is now included in this check. Previously it was
+# defined and used in _wp_auth_headers() but never validated at startup, so
+# a missing secret in THIS repo's GitHub Actions config would fail silently —
+# every request would go out with no X-Internal-Auth header and no warning
+# anywhere in the logs, making it look like a Cloudflare-only problem even
+# when the secret itself was the missing piece.
 for _var, _val, _feature in [
     ("MISTRAL_API_KEY", MISTRAL_API_KEY, "paraphrasing"),
     ("WP_USERNAME",     WP_USER,         "WordPress posting"),
     ("WP_APP_PASSWORD", WP_PASSWORD,     "WordPress posting"),
+    ("INTERNAL_BOT_KEY", INTERNAL_BOT_KEY, "Cloudflare X-Internal-Auth header (bot-rule bypass)"),
 ]:
     if not _val:
         logging.getLogger(__name__).warning(
             f"Environment variable {_var} is not set — {_feature} will be disabled/skipped."
         )
+
+# FIX: loud, unmissable confirmation printed once at startup (not just a
+# logging.warning, which can get lost among INFO-level scrape logs) so a
+# glance at the GitHub Actions run output tells you immediately whether this
+# specific repo/workflow actually has the secret wired up.
+print("=" * 80)
+if INTERNAL_BOT_KEY:
+    print(f"[STARTUP CHECK] INTERNAL_BOT_KEY is SET (length={len(INTERNAL_BOT_KEY)}) "
+          f"— X-Internal-Auth header WILL be sent on every WordPress request.")
+else:
+    print("[STARTUP CHECK] INTERNAL_BOT_KEY is EMPTY/MISSING "
+          "— X-Internal-Auth header will NOT be sent. Add it as a GitHub "
+          "Actions secret for this repo if you rely on it to bypass a "
+          "Cloudflare WAF/rate-limit rule.")
+print("=" * 80)
 
 JOB_TYPE_MAPPING = {
     "full-time": "full-time", "full time": "full-time",
@@ -1288,6 +1310,7 @@ def main():
     print(f"  Resolve apply   : {'✅ enabled' if RESOLVE_APPLY_URLS else '❌ disabled'}")
     print(f"  Paraphrase      : {'✅ enabled' if (ENABLE_PARAPHRASE and MISTRAL_API_KEY) else '❌ disabled'}")
     print(f"  WordPress post  : {'✅ enabled' if (WP_USER and WP_PASSWORD) else '❌ disabled'}")
+    print(f"  Internal bot key: {'✅ set' if INTERNAL_BOT_KEY else '❌ NOT set (X-Internal-Auth header will be missing)'}")
     print(f"  Excel export    : {'✅ enabled' if _XLSX_AVAILABLE else '❌ disabled (pip install pandas openpyxl)'}")
     print(f"  NLP gating      : {'✅' if _NLP_AVAILABLE else '⚠️  no sentence-transformers / language-tool'}")
     print(f"  Started         : {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
